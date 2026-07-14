@@ -112,34 +112,44 @@ location_mode = st.radio(
 
 lat, lon = DEFAULT_COORDS
 city, state_code = DEFAULT_CITY, DEFAULT_STATE
-location_warning = None  # surfaced to the user instead of silently swallowed
+location_warning = None  # surfaced to user
 
 if location_mode == "🛰️ Auto-Detect My Location (Browser/Server IP)":
     try:
+        # Step 1: Attempt headers extraction (useful when deployed)
         headers = st.context.headers
         client_ip = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
-        client_ip = client_ip.split(",")[0].strip() if client_ip else None
+        if client_ip:
+            client_ip = client_ip.split(",")[0].strip()
+        
+        # Step 2: Fallback to a global IP resolution echo API if headers are blank/localhost
+        if not client_ip or client_ip in ("127.0.0.1", "localhost", "::1"):
+            try:
+                client_ip = requests.get("https://api64.ipify.org", timeout=3).text.strip()
+            except Exception:
+                client_ip = None
 
-        geo_url = f"https://ipapi.co/{client_ip}/json/" if client_ip else "https://ipapi.co/json/"
+        # Step 3: Query IP location via ip-api.com (reliable, unauthenticated)
+        geo_url = f"http://ip-api.com/json/{client_ip}" if client_ip else "http://ip-api.com/json/"
         geo_res = requests.get(geo_url, timeout=5).json()
 
-        if "latitude" in geo_res:
-            lat = geo_res["latitude"]
-            lon = geo_res["longitude"]
+        if geo_res.get("status") == "success" and "lat" in geo_res:
+            lat = geo_res["lat"]
+            lon = geo_res["lon"]
             city = geo_res.get("city", "Unknown City")
-            state_code = geo_res.get("region_code", DEFAULT_STATE)
+            state_code = geo_res.get("region", DEFAULT_STATE)
 
-            # NWS (used later) only covers the US — warn if IP geolocation lands elsewhere.
-            if geo_res.get("country_code") not in (None, "US"):
+            # NWS only covers the US
+            if geo_res.get("countryCode") not in (None, "US"):
                 location_warning = (
-                    f"Detected location ({city}, {geo_res.get('country_name', 'unknown country')}) "
+                    f"Detected location ({city}, {geo_res.get('country', 'unknown country')}) "
                     "is outside the US. Weather and grid-rate assumptions below are US-calibrated "
                     "and may not be meaningful here."
                 )
         else:
-            location_warning = "Could not auto-detect location from IP. Using default: Folsom, CA."
-    except Exception:
-        location_warning = "Location auto-detection failed (network/API issue). Using default: Folsom, CA."
+            location_warning = "Could not parse geolocation from IP API. Using default: Folsom, CA."
+    except Exception as e:
+        location_warning = f"Location auto-detection failed ({str(e)}). Using default: Folsom, CA."
 
 elif location_mode == "🏙️ Quick-Select US Tech Hubs":
     hub_selection = st.selectbox("Select target hub:", list(TECH_HUBS.keys()))
@@ -184,7 +194,6 @@ def fetch_location_data_streams(lat: float, lon: float):
         if results:
             raw_name = results[0].get("county_name", "Local County")
             county_name = raw_name
-            # Normalize "Sacramento County" -> "sacramento" before dict lookup.
             lookup_key = raw_name.lower().replace(" county", "").strip()
             local_pop = KNOWN_COUNTY_POPULATIONS.get(lookup_key, DEFAULT_POPULATION)
         else:
@@ -214,21 +223,42 @@ def fetch_location_data_streams(lat: float, lon: float):
 @st.cache_data(ttl=1800)
 def scan_local_hydrology(lat: float, lon: float):
     """Returns (water_body_name, water_body_type, lookup_failed)."""
+    # Reduced radius slightly to 15,000m (15km) to accelerate response and decrease timeout risk
     query = f"""
-    [out:json][timeout:20];
+    [out:json][timeout:15];
     (
-      nwr["waterway"~"river|canal"](around:30000,{lat},{lon});
-      nwr["natural"="water"](around:30000,{lat},{lon});
-      nwr["landuse"="reservoir"](around:30000,{lat},{lon});
+      nwr["waterway"~"river|canal"](around:15000,{lat},{lon});
+      nwr["natural"="water"](around:15000,{lat},{lon});
+      nwr["landuse"="reservoir"](around:15000,{lat},{lon});
     );
     out tags center;
     """
-    try:
-        response = requests.get("https://overpass-api.de/api/interpreter", params={"data": query}, timeout=10)
-        data = response.json()
+    
+    # List of redundant Overpass API public endpoints to loop through in case of rate-limiting
+    endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter"
+    ]
 
+    response_data = None
+    success = False
+
+    for endpoint in endpoints:
+        try:
+            response = requests.get(endpoint, params={"data": query}, timeout=8)
+            if response.status_code == 200:
+                response_data = response.json()
+                success = True
+                break
+        except Exception:
+            continue
+
+    if not success or not response_data:
+        return "Hydrology scan unavailable", "none", True
+
+    try:
         rivers, lakes = [], []
-        for element in data.get("elements", []):
+        for element in response_data.get("elements", []):
             tags = element.get("tags", {})
             name = tags.get("name") or tags.get("official_name")
             if not name:
@@ -244,9 +274,9 @@ def scan_local_hydrology(lat: float, lon: float):
             return max(unique_lakes, key=len), "lake", False
         if unique_rivers:
             return max(unique_rivers, key=len), "river", False
-        return "No major surface water bodies detected within 30km", "none", False
+        return "No major surface water bodies detected within 15km", "none", False
     except Exception:
-        return "Hydrology scan unavailable", "none", True
+        return "Hydrology scan evaluation failed", "none", True
 
 
 with st.spinner("Pulling census, weather, and hydrology telemetry..."):
@@ -297,32 +327,27 @@ else:
 base_surface_water = BASE_GROUNDWATER_GAL * surface_water_multiplier
 total_municipal_water_budget = BASE_GROUNDWATER_GAL + base_surface_water
 
-# Human baseline demands
+# Human demands
 human_water_usage_daily = local_population * HUMAN_WATER_GAL_PER_PERSON_DAY
 human_power_usage_daily = local_population * HUMAN_POWER_KWH_PER_PERSON_DAY
 
-# Model imported aqueduct capacity for population centers whose local budget can't cover baseline demand
 if total_municipal_water_budget < (human_water_usage_daily * 1.2):
     total_municipal_water_budget = human_water_usage_daily * 1.5
     surface_water_source += " + Imported Aqueduct Systems"
 
-# Cooling-tech efficiency
 modifiers = COOLING_TECH_MODIFIERS[cooling_tech]
 power_modifier, water_modifier = modifiers["power"], modifiers["water"]
 
-# AI direct demands
 ai_power_demand_mw = data_center_size * power_modifier
 ai_power_demand_kwh_daily = ai_power_demand_mw * 1000 * 24
 
 base_water_per_mw = WATER_PER_MW_HEATWAVE if is_heatwave else WATER_PER_MW_NORMAL
 ai_direct_water_demand = (data_center_size * base_water_per_mw) * water_modifier
 
-# Indirect (Scope 2) water via grid generation
 indirect_water_factor = INDIRECT_WATER_FACTOR_CA if state_code == "CA" else INDIRECT_WATER_FACTOR_OTHER
 ai_indirect_water_demand = ai_power_demand_kwh_daily * indirect_water_factor
 total_ai_water_demand = ai_direct_water_demand + ai_indirect_water_demand
 
-# Grid headroom & pricing under heatwave stress
 if is_heatwave:
     available_grid = BASE_SPARE_GRID_MW * HEATWAVE_GRID_CAPACITY_FACTOR
     electricity_rate = HEATWAVE_RATE_USD_PER_KWH
@@ -336,7 +361,6 @@ remaining_grid = available_grid - ai_power_demand_mw
 remaining_water = total_municipal_water_budget - (human_water_usage_daily + total_ai_water_demand)
 daily_energy_cost = ai_power_demand_kwh_daily * electricity_rate
 
-# Guard against divide-by-zero for edge-case zero population
 water_ratio = (total_ai_water_demand / human_water_usage_daily * 100.0) if human_water_usage_daily else 0.0
 power_ratio = (ai_power_demand_kwh_daily / human_power_usage_daily * 100.0) if human_power_usage_daily else 0.0
 
@@ -433,7 +457,7 @@ else:
     """)
 
 # =============================================================================
-# CHARTS — split by unit so bar heights are directly comparable within each chart
+# CHARTS
 # =============================================================================
 st.subheader("📋 Resource Balance & Nexus Matrix")
 
@@ -457,7 +481,7 @@ with chart_col2:
 
 st.markdown(f"🛰️ **Live Hydrological Telemetry:** Nearby Water Body detected: **{surface_water_source}**.")
 st.caption(
-    f"System Telemetry Signature: handshakes attempted with api.zippopotam.us, geo.fcc.gov, "
-    f"api.weather.gov, and overpass-api.de (fields default to conservative estimates on failure). "
+    f"System Telemetry Signature: handshakes attempted with ipify.org, ip-api.com, geo.fcc.gov, "
+    f"api.weather.gov, and overpass-api.de mirrors. "
     f"Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC."
 )
