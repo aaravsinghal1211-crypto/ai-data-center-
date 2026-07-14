@@ -14,8 +14,8 @@ st.set_page_config(
 st.title("⚡ Advanced AI Infrastructure Systems & Resource Stress Matrix")
 st.markdown("""
 This systems-engineering dashboard models both the **direct** and **indirect** infrastructure burdens 
-of scaling AI. By default, it tracks your live telemetry, but you can select different regions across the US 
-using the Interactive Map Controller below to simulate geographical stress tests.
+of scaling AI. You can select **Auto-Detect** to find your local grid, or type **any city in the US** to 
+simulate a live regional infrastructure stress test.
 """)
 
 st.write("---")
@@ -44,31 +44,56 @@ st.sidebar.markdown("""
 * **Economic Risk Layer:** Ambient-heat dynamic utility pricing.
 """)
 
-# 3. INTERACTIVE GEOGRAPHIC LOCATION SELECTOR
+# 3. SMART GLOBAL SEARCH BAR & GEOCODING ENGINE
 st.subheader("🗺️ Node Location & Simulation Target")
 
-# A dictionary of interesting testing targets with different profiles!
-US_TARGETS = {
-    "📍 Auto-Detect My Location (Default)": {"lat": None, "lon": None, "city": "Auto-Detect", "state_code": "Auto-Detect"},
-    "Folsom, California (Clean Solar Grid)": {"lat": 38.6780, "lon": -121.1761, "city": "Folsom", "state_code": "CA"},
-    "The Dalles, Oregon (Hydroelectric Hub)": {"lat": 45.5946, "lon": -121.1787, "city": "The Dalles", "state_code": "OR"},
-    "Phoenix, Arizona (Extreme Desert Heat)": {"lat": 33.4484, "lon": -112.0740, "city": "Phoenix", "state_code": "AZ"},
-    "Chicago, Illinois (Standard Mid-West Coal Grid)": {"lat": 41.8781, "lon": -87.6298, "city": "Chicago", "state_code": "IL"},
-    "Minneapolis, Minnesota (Cold Northern Climate)": {"lat": 44.9778, "lon": -93.2650, "city": "Minneapolis", "state_code": "MN"},
-    "Ashburn, Virginia (World's Largest Data Center Hub)": {"lat": 39.0438, "lon": -77.4875, "city": "Ashburn", "state_code": "VA"}
-}
+# Step A: Let user toggle between Auto-Detect and Manual Search
+location_mode = st.radio(
+    "Choose Simulation Target Location Method:",
+    ["🛰️ Auto-Detect My Location (Browser/Server IP)", "🔍 Search Any US City"]
+)
 
-selected_target_name = st.selectbox("Select target destination to test:", list(US_TARGETS.keys()))
-selected_target = US_TARGETS[selected_target_name]
+# Step B: Provide the search box if they choose Manual Search
+search_query = ""
+if location_mode == "🔍 Search Any US City":
+    search_query = st.text_input(
+        "Enter US City and State (e.g., Duluth, MN or Folsom, CA):",
+        value="Folsom, CA"
+    )
 
-# 4. TELEMETRY ENGINE (IP Lookup / Fallback)
-def fetch_system_telemetry(custom_lat=None, custom_lon=None):
-    # Default fallback (Folsom, CA)
-    city, state, state_code = "Folsom", "California", "CA"
+# Cache geocoding to prevent excessive API queries
+@st.cache_data(ttl=3600)
+def geocode_city_osm(query_string):
+    """Translates any written city/state query into coordinates and metadata."""
+    try:
+        headers = {'User-Agent': 'AI-Data-Center-Simulator-Science-Fair-Project (student@sciencefair.com)'}
+        url = f"https://nominatim.openstreetmap.org/search?q={requests.utils.quote(query_string)}&format=json&addressdetails=1&limit=1"
+        res = requests.get(url, headers=headers, timeout=5).json()
+        if res:
+            place = res[0]
+            lat = float(place["lat"])
+            lon = float(place["lon"])
+            address = place.get("address", {})
+            city = address.get("city") or address.get("town") or address.get("village") or address.get("county") or "Unknown City"
+            state_code = address.get("state") or "US"
+            # Normalize state codes to CA check
+            if state_code.lower() in ["california", "ca"]:
+                clean_state_code = "CA"
+            else:
+                clean_state_code = "OTHER"
+            return lat, lon, city, clean_state_code
+    except Exception:
+        pass
+    return None
+
+# Step C: Resolve Telemetry Engine
+def fetch_system_telemetry(user_lat=None, user_lon=None, custom_city=None, custom_state=None):
+    # Default fallbacks
+    city, state_code = "Folsom", "CA"
     lat, lon = 38.6780, -121.1761
     
-    # Run Auto-Detect if no specific coordinates are provided
-    if custom_lat is None:
+    if user_lat is None:
+        # Auto-detect via client IP
         try:
             headers = st.context.headers
             client_ip = None
@@ -86,18 +111,17 @@ def fetch_system_telemetry(custom_lat=None, custom_lon=None):
                 lat = geo_res["latitude"]
                 lon = geo_res["longitude"]
                 city = geo_res.get("city", "Unknown City")
-                state = geo_res.get("region", "California")
-                state_code = geo_res.get("region_code", "CA")
+                state_code = "CA" if geo_res.get("region_code") == "CA" else "OTHER"
         except Exception:
             pass
     else:
-        # Use target coordinate profile chosen by user
-        lat, lon = custom_lat, custom_lon
-        city = selected_target["city"]
-        state_code = selected_target["state_code"]
-        state = selected_target["state_code"]
+        # Use Custom Geocoded values
+        lat, lon = user_lat, user_lon
+        city = custom_city
+        state_code = custom_state
 
-    temp_f = 75.0  # Default baseline temp
+    # Fetch NWS Temperature Live
+    temp_f = 75.0
     try:
         nws_headers = {'User-Agent': '(mycalcairfairproject.com, student@sciencefair.com)'}
         points_url = f"https://api.weather.gov/points/{round(lat,4)},{round(lon,4)}"
@@ -113,27 +137,38 @@ def fetch_system_telemetry(custom_lat=None, custom_lon=None):
     except Exception:
         pass
 
-    return city, state, state_code, lat, lon, round(temp_f, 1)
+    return city, state_code, lat, lon, round(temp_f, 1)
 
-# Execute telemetry pull
-city, state, state_code, lat, lon, local_temp = fetch_system_telemetry(selected_target["lat"], selected_target["lon"])
 
-# Render map visual directly in Streamlit
+# Resolve coordinates based on mode selected
+custom_coords = None
+if location_mode == "🔍 Search Any US City" and search_query:
+    custom_coords = geocode_city_osm(search_query)
+
+if custom_coords:
+    glat, glon, gcity, gstate = custom_coords
+    city, state_code, lat, lon, local_temp = fetch_system_telemetry(glat, glon, gcity, gstate)
+else:
+    # Trigger Auto-Detect
+    city, state_code, lat, lon, local_temp = fetch_system_telemetry()
+
+# Render visual map and telemetry cards
 map_col, text_col = st.columns([2, 1])
 
 with map_col:
-    m = folium.Map(location=[lat, lon], zoom_start=9)
+    # Draw interactive folium map
+    m = folium.Map(location=[lat, lon], zoom_start=10)
     folium.Marker(
         [lat, lon], 
         popup=f"{city}, {state_code}", 
-        tooltip=f"Active Simulation: {city}"
+        tooltip=f"Active Simulation Center"
     ).add_to(m)
-    # Output map to web page
+    # Output map cleanly to screen without container width crash
     st_folium(m, height=300, width=700)
 
 with text_col:
     st.write("### Telemetry Status")
-    st.metric(label="🛰️ Target Node Location", value=f"{city}, {state_code}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
+    st.metric(label="🛰️ Current Simulation Node", value=f"{city}, {state_code}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
     is_heatwave = local_temp >= 95.0
     st.metric(
         label="☀️ NOAA Weather Feed", 
@@ -144,7 +179,7 @@ with text_col:
 
 st.write("---")
 
-# 5. ADVANCED INFRASTRUCTURE MATHEMATICAL MATRIX
+# 4. ADVANCED INFRASTRUCTURE MATHEMATICAL MATRIX
 base_spare_grid = 250.0       # MW capacity baseline
 base_groundwater = 5000000.0  # Gallons per day baseline
 
@@ -184,7 +219,7 @@ total_water_demand = ai_direct_water_demand + ai_indirect_water_demand
 remaining_water = base_groundwater - total_water_demand
 daily_energy_cost = ai_power_demand * 1000 * 24 * electricity_rate
 
-# 6. HIGH-IMPACT METRICS DISPLAY
+# 5. HIGH-IMPACT METRICS DISPLAY
 st.subheader(f"📊 Real-Time Multi-Variable Impact Report ({grid_status})")
 
 col1, col2, col3 = st.columns(3)
@@ -205,7 +240,7 @@ with col5:
 
 st.write("---")
 
-# 7. CRITICAL BREAKING POINT ALERT PROTOCOLS
+# 6. CRITICAL BREAKING POINT ALERT PROTOCOLS
 if remaining_grid < 0 or remaining_water < 0:
     st.error(f"""
     ### 🚨 SYSTEM CRISIS INTERVENTION REQUIRED
@@ -218,7 +253,7 @@ if remaining_grid < 0 or remaining_water < 0:
 else:
     st.success(f"✅ Infrastructure Security Threshold Checked. The {city} grid configuration can securely contain this facility's current engineering envelope.")
 
-# 8. MULTI-LAYER CHARTING
+# 7. MULTI-LAYER CHARTING
 st.subheader("📋 Resource Balance & Nexus Matrix")
 chart_data = {
     "Infrastructure Category": ["Grid Overhead (MW)", "Grid Overhead (MW)", "Water Systems (M-Gal/Day)", "Water Systems (M-Gal/Day)", "Water Systems (M-Gal/Day)"],
