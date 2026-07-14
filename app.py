@@ -36,7 +36,7 @@ cooling_tech = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
-### 🧠 Active Simulation Rules:
+### 🧠 Active App Rules:
 * **Scope 1 (Direct) Water:** Evaporated on-site for thermal management.
 * **Scope 2 (Indirect) Water:** Consumed off-site at power plants to generate grid electricity.
 * **Census Population Benchmark:** Compares AI footprint to local human baselines (80 Gal of water & 12 kWh of power per person/day).
