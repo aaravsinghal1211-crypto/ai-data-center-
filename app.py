@@ -298,9 +298,27 @@ else:
 # 9. MULTI-LAYER CHARTING
 st.subheader("📋 Resource Balance & Nexus Matrix")
 chart_data = {
-    "Resource Class": ["Water Systems (Gal/Day)", "Water Systems (Gal/Day)", "Electrical Power (kWh/Day)", "Electrical Power (kWh/Day)"],
-    "Entity": ["Human Baseline", "AI Data Center", "Human Baseline", "AI Data Center"],
-    "Values": [human_water_usage_daily, total_ai_water_demand, human_power_usage_daily, ai_power_demand_kwh_daily]
+    "Resource Class": [
+        "Water Systems (Gal/Day)", 
+        "Water Systems (Gal/Day)", 
+        "Water Systems (Gal/Day)",  # Added for available water
+        "Electrical Power (kWh/Day)", 
+        "Electrical Power (kWh/Day)"
+    ],
+    "Entity": [
+        "Human Baseline", 
+        "AI Data Center", 
+        "Aquifer Capacity (Total Available)",  # Added label
+        "Human Baseline", 
+        "AI Data Center"
+    ],
+    "Values": [
+        human_water_usage_daily, 
+        total_ai_water_demand, 
+        base_groundwater,  # Added the 5,000,000 Gallon baseline limit here
+        human_power_usage_daily, 
+        ai_power_demand_kwh_daily
+    ]
 }
 st.bar_chart(data=chart_data, x="Resource Class", y="Values", color="Entity", stack=False)
 
