@@ -42,15 +42,30 @@ st.sidebar.markdown("""
 * **Grid Economic Risk Assessment:** Tracks real-time ambient heat to simulate power grid congestion and peak surge utility pricing.
 """)
 
-# 3. REAL-TIME DATA TELEMETRY (IP Geolocation & NWS Weather API)
-@st.cache_data(ttl=300)
+# 3. REAL-TIME DATA TELEMETRY (Smart Client Geolocation & NWS Weather API)
 def fetch_system_telemetry():
-    # Default Fallback (Folsom, CA - Central Tech Corridor)
+    # Default fallback (Folsom, CA - Central Tech Corridor)
     city, state, state_code = "Folsom", "California", "CA"
     lat, lon = 38.6780, -121.1761
     
+    # Try to grab the actual visitor's IP address from Streamlit's network headers
     try:
-        geo_res = requests.get("https://ipapi.co/json/", timeout=5).json()
+        headers = st.context.headers
+        client_ip = None
+        
+        # Streamlit cloud uses reverse-proxies; the real user's IP sits in X-Forwarded-For
+        if "x-forwarded-for" in headers:
+            client_ip = headers["x-forwarded-for"].split(",")[0].strip()
+        elif "X-Forwarded-For" in headers:
+            client_ip = headers["X-Forwarded-For"].split(",")[0].strip()
+            
+        # If we successfully isolated the visitor's real IP, geolocate them!
+        if client_ip:
+            geo_res = requests.get(f"https://ipapi.co/{client_ip}/json/", timeout=5).json()
+        else:
+            # Fallback to server IP if none detected
+            geo_res = requests.get("https://ipapi.co/json/", timeout=5).json()
+            
         if "latitude" in geo_res:
             lat = geo_res["latitude"]
             lon = geo_res["longitude"]
@@ -84,7 +99,7 @@ city, state, state_code, lat, lon, local_temp = fetch_system_telemetry()
 # Display Location and Weather Data Streams
 col_a, col_b = st.columns(2)
 with col_a:
-    st.metric(label="🛰️ Compute Node Execution Site (Cloud Core)", value=f"{city}, {state}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
+    st.metric(label="🛰️ Visitor Node Location", value=f"{city}, {state}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
 with col_b:
     is_heatwave = local_temp >= 95.0
     st.metric(
@@ -117,7 +132,6 @@ base_water_per_mw = 50000.0 if is_heatwave else 25000.0
 ai_direct_water_demand = (data_center_size * base_water_per_mw) * water_modifier
 
 # Indirect Water Multiplier (Scope 2 Energy-Water Nexus)
-# Fossil/Thermoelectric grids consume significantly more water per kWh than renewable grids
 indirect_water_factor = 0.13 if state_code == "CA" else 1.2  # Gal per kWh
 ai_indirect_water_demand = ai_power_demand * 1000 * 24 * indirect_water_factor
 
