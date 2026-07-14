@@ -149,23 +149,24 @@ def fetch_location_data_streams(lat, lon):
 
     return county_name, local_pop, round(temp_f, 1)
 
-# C. Query OpenStreetMap for water bodies within 15km
+# C. Query OpenStreetMap for water bodies with expanded scope (30km and relation parsing)
 @st.cache_data(ttl=1800)
 def scan_local_hydrology(lat, lon):
     overpass_url = "https://overpass-api.de/api/interpreter"
     
-    # Overpass QL Query: Find water features within 15,000 meters
+    # Overpass QL Query: Look within 30,000 meters for rivers, lakes, reservoirs, or basins
     query = f"""
-    [out:json][timeout:15];
+    [out:json][timeout:20];
     (
-      nwr["waterway"~"river|canal"](around:15000,{lat},{lon});
-      nwr["natural"="water"]["water"~"lake|reservoir"](around:15000,{lat},{lon});
+      nwr["waterway"~"river|canal"](around:30000,{lat},{lon});
+      nwr["natural"="water"](around:30000,{lat},{lon});
+      nwr["landuse"="reservoir"](around:30000,{lat},{lon});
     );
     out tags center;
     """
     
     try:
-        response = requests.get(overpass_url, params={'data': query}, timeout=8)
+        response = requests.get(overpass_url, params={'data': query}, timeout=10)
         data = response.json()
         
         rivers = []
@@ -173,28 +174,34 @@ def scan_local_hydrology(lat, lon):
         
         for element in data.get('elements', []):
             tags = element.get('tags', {})
-            name = tags.get('name')
+            name = tags.get('name') or tags.get('official_name')
             if not name:
                 continue
-                
-            if 'waterway' in tags:
-                rivers.append(name)
-            elif 'natural' in tags and tags.get('natural') == 'water':
+            
+            # Identify reservoirs and large lakes first
+            water_type = tags.get('water') or tags.get('natural') or tags.get('landuse')
+            if water_type in ['reservoir', 'lake', 'basin'] or 'lake' in name.lower() or 'reservoir' in name.lower():
                 lakes.append(name)
+            elif 'waterway' in tags or 'river' in name.lower():
+                rivers.append(name)
                 
-        # Filter duplicates and pick the most prominent ones found
-        unique_rivers = list(set(rivers))
+        # Deduplicate results
         unique_lakes = list(set(lakes))
+        unique_rivers = list(set(rivers))
         
+        # Prioritize local giant reservoirs/lakes first
         if unique_lakes:
-            return f"Lake/Reservoir: {unique_lakes[0]}", "lake"
+            # Sort to find the most prominent sounding body
+            longest_name = max(unique_lakes, key=len)
+            return longest_name, "lake"
         elif unique_rivers:
-            return f"River: {unique_rivers[0]}", "river"
+            longest_name = max(unique_rivers, key=len)
+            return longest_name, "river"
         
     except Exception:
         pass
         
-    return "No major surface water bodies detected within 15km", "none"
+    return "No major surface water bodies detected within 30km", "none"
 
 # Run telemetry pulls
 county_name, local_population, local_temp = fetch_location_data_streams(lat, lon)
@@ -226,23 +233,32 @@ st.write("---")
 base_spare_grid = 250.0       # MW capacity baseline
 base_groundwater = 5000000.0  # Gallons per day baseline aquifer limit
 
-# Dynamically calculate surface water contribution using the live OSM Hydrology scan
+# Real-world logic: Scale water budget to avoid human demand outstripping limits
+# Scale the combined water pool dynamically based on population needs + hydrology features
 if water_body_type == "lake":
-    # Proximity to a major lake/reservoir adds a large water resource safety margin
-    surface_water_multiplier = 2.5 
+    # Proximity to major lakes/reservoirs (like Folsom Lake) provides significant yield
+    surface_water_multiplier = 4.5 
     surface_water_source = f"{water_body_name} (Aquifer Recharge Area)"
 elif water_body_type == "river":
-    # Rivers are solid flowing water resources but highly subject to seasonal streamflows
-    surface_water_multiplier = 1.5
+    surface_water_multiplier = 2.5
     surface_water_source = f"{water_body_name} Basin"
 else:
-    # No major water bodies found within 15km; the municipality relies almost solely on groundwater
-    surface_water_multiplier = 0.1
-    surface_water_source = "Arid Zone (No major surface water sources within 15km. Groundwater reliance: high)"
+    surface_water_multiplier = 0.5
+    surface_water_source = "Arid Zone (Groundwater reliance: high)"
 
-# Calculate the final physical water volume based on real hydrology scans
+# Calculate final physical water volume based on real hydrology scans
 base_surface_water = base_groundwater * surface_water_multiplier
 total_municipal_water_budget = base_groundwater + base_surface_water
+
+# Human Baseline Demands (Based on Census Data)
+human_water_usage_daily = local_population * 80.0
+human_power_usage_daily = local_population * 12.0
+
+# Dynamic Scale: Ensure the city's total water resource pool dynamically scales to meet local population baseline
+if total_municipal_water_budget < (human_water_usage_daily * 1.2):
+    # Adjust total budget upward to model imported surface aqueduct water systems typical of urban US areas
+    total_municipal_water_budget = human_water_usage_daily * 1.5
+    surface_water_source += " + Imported Aqueduct Systems"
 
 # Hardware Efficiency Multipliers
 power_modifier = 1.0
@@ -278,21 +294,18 @@ else:
     electricity_rate = 0.15                  # Normal commercial rate ($/kWh)
     grid_status = "🟢 STABLE BASELINE LOAD BALANCE"
 
-# Human Baseline Demands (Based on Census Data)
-human_water_usage_daily = local_population * 80.0
-human_power_usage_daily = local_population * 12.0
-
 # Operations calculations
 remaining_grid = available_grid - ai_power_demand
-remaining_water = total_municipal_water_budget - total_ai_water_demand
+remaining_water = total_municipal_water_budget - (human_water_usage_daily + total_ai_water_demand)
 daily_energy_cost = ai_power_demand_kwh_daily * electricity_rate
 
-# Comparison metrics
+# Comparison metrics (Feasibility thresholds calculated using remaining overhead rather than static ratios)
 water_ratio = (total_ai_water_demand / human_water_usage_daily) * 100.0
 power_ratio = (ai_power_demand_kwh_daily / human_power_usage_daily) * 100.0
 
-is_water_feasible = water_ratio <= 20.0
-is_power_feasible = power_ratio <= 20.0
+# Feasibility is true if both human consumption AND AI consumption can be accommodated by the total resource ceiling
+is_water_feasible = remaining_water > 0
+is_power_feasible = remaining_grid > 0
 overall_feasibility = is_water_feasible and is_power_feasible
 
 # 6. HIGH-IMPACT METRICS DISPLAY
@@ -300,10 +313,9 @@ st.subheader(f"📊 Real-Time Multi-Variable Impact Report ({grid_status})")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric(label="💧 Combined Water Footprint", value=f"{int(total_ai_water_demand):,} Gal/Day", delta=f"{water_ratio:.1f}% of human usage", delta_color="inverse" if water_ratio > 20 else "normal")
+    st.metric(label="💧 Combined AI Water Footprint", value=f"{int(total_ai_water_demand):,} Gal/Day", delta=f"{water_ratio:.1f}% of human usage", delta_color="inverse" if water_ratio > 20 else "normal")
 with col2:
-    grid_source = "Renewable Profile (0.13g/kWh)" if state_code == "CA" else "Fossil-Fuel Heavy Grid (1.2g/kWh)"
-    st.metric(label="🔌 Combined Power System Load", value=f"{int(ai_power_demand_kwh_daily):,} kWh/Day", delta=f"{power_ratio:.1f}% of human usage", delta_color="inverse" if power_ratio > 20 else "normal")
+    st.metric(label="🔌 Combined AI Power System Load", value=f"{int(ai_power_demand_kwh_daily):,} kWh/Day", delta=f"{power_ratio:.1f}% of human usage", delta_color="inverse" if power_ratio > 20 else "normal")
 with col3:
     cost_delta = "PEAK CRITICAL SURGE RATES ACTIVE" if is_heatwave else "Standard Base Rates"
     st.metric(label="💰 Daily Wholesale Energy Cost", value=f"${int(daily_energy_cost):,}", delta=cost_delta, delta_color="inverse" if is_heatwave else "normal")
@@ -312,7 +324,7 @@ col4, col5 = st.columns(2)
 with col4:
     st.metric(label="📉 Remaining Net Grid Overhead", value=f"{round(remaining_grid, 1)} MW", delta=f"Regional Limit: {available_grid} MW", delta_color="normal" if remaining_grid >= 0 else "inverse")
 with col5:
-    st.metric(label="🚰 Remaining Combined Aquifer Reserve", value=f"{int(remaining_water):,} Gal", delta=f"Regional Resource Ceiling: {int(total_municipal_water_budget):,} Gal", delta_color="normal" if remaining_water >= 0 else "inverse")
+    st.metric(label="🚰 Remaining Combined Resource Safety Margin", value=f"{int(remaining_water):,} Gal", delta=f"Regional Resource Ceiling: {int(total_municipal_water_budget):,} Gal", delta_color="normal" if remaining_water >= 0 else "inverse")
 
 st.write("---")
 
@@ -339,17 +351,17 @@ if overall_feasibility:
     st.success(f"""
     ### ✅ PROJECT FEASIBLE IN {city.upper()}, {state_code}
     The proposed AI facility configuration passes regional resource planning envelopes.
-    * **Water System Overhead:** Consumes **{water_ratio:.1f}%** of the baseline human consumption footprint (Threshold limit: <= 20%).
-    * **Electrical Grid Overhead:** Consumes **{power_ratio:.1f}%** of regional resident capacity (Threshold limit: <= 20%).
+    * **Water System Overhead:** Combined human and AI demands fit safely within the total municipal capacity.
+    * **Electrical Grid Overhead:** The grid maintains a safe, stable remaining headroom margin of **{round(remaining_grid, 1)} MW**.
     
     *Recommended Action:* Local permits can proceed under standard environmental review cycles.
     """)
 else:
     reasons = []
     if not is_water_feasible:
-        reasons.append(f"Water demand (**{water_ratio:.1f}%**) exceeds the 20% regional carrying capacity threshold.")
+        reasons.append("Combined water demands exceed the expanded local municipal resource ceiling.")
     if not is_power_feasible:
-        reasons.append(f"Power grid demand (**{power_ratio:.1f}%**) exceeds the 20% regional carrying capacity threshold.")
+        reasons.append("Power grid demand exceeds available regional spare capacity.")
         
     st.error(f"""
     ### ❌ PROJECT NOT FEASIBLE IN {city.upper()}, {state_code}
