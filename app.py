@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 from datetime import datetime
+import folium
+from streamlit_folium import st_folium
 
 # 1. SET UP THE WEB PAGE LAYOUT
 st.set_page_config(
@@ -11,9 +13,9 @@ st.set_page_config(
 
 st.title("⚡ Advanced AI Infrastructure Systems & Resource Stress Matrix")
 st.markdown("""
-This advanced systems-engineering dashboard models both the **direct** and **indirect** infrastructure burdens 
-of scaling AI. It tracks live location telemetry and pulls real-time environmental metrics directly from the 
-**National Weather Service (NOAA)** to calculate grid economic risk and localized aquifer depletion profiles.
+This systems-engineering dashboard models both the **direct** and **indirect** infrastructure burdens 
+of scaling AI. By default, it tracks your live telemetry, but you can select different regions across the US 
+using the Interactive Map Controller below to simulate geographical stress tests.
 """)
 
 st.write("---")
@@ -37,43 +39,63 @@ cooling_tech = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 ### 🧠 Advanced System Layers Active:
-* **Scope 1 (Direct) Water Footprint:** Liquid evaporated on-site for thermal management.
-* **Scope 2 (Indirect) Water Footprint:** Water consumed off-site at thermoelectric plants to generate the electricity required.
-* **Grid Economic Risk Assessment:** Tracks real-time ambient heat to simulate power grid congestion and peak surge utility pricing.
+* **Scope 1 (Direct) Water:** On-site cooling evaporation.
+* **Scope 2 (Indirect) Water:** Off-site power generation water draw.
+* **Economic Risk Layer:** Ambient-heat dynamic utility pricing.
 """)
 
-# 3. REAL-TIME DATA TELEMETRY (Smart Client Geolocation & NWS Weather API)
-def fetch_system_telemetry():
-    # Default fallback (Folsom, CA - Central Tech Corridor)
+# 3. INTERACTIVE GEOGRAPHIC LOCATION SELECTOR
+st.subheader("🗺️ Node Location & Simulation Target")
+
+# A dictionary of interesting testing targets with different profiles!
+US_TARGETS = {
+    "📍 Auto-Detect My Location (Default)": {"lat": None, "lon": None, "city": "Auto-Detect", "state_code": "Auto-Detect"},
+    "Folsom, California (Clean Solar Grid)": {"lat": 38.6780, "lon": -121.1761, "city": "Folsom", "state_code": "CA"},
+    "The Dalles, Oregon (Hydroelectric Hub)": {"lat": 45.5946, "lon": -121.1787, "city": "The Dalles", "state_code": "OR"},
+    "Phoenix, Arizona (Extreme Desert Heat)": {"lat": 33.4484, "lon": -112.0740, "city": "Phoenix", "state_code": "AZ"},
+    "Chicago, Illinois (Standard Mid-West Coal Grid)": {"lat": 41.8781, "lon": -87.6298, "city": "Chicago", "state_code": "IL"},
+    "Minneapolis, Minnesota (Cold Northern Climate)": {"lat": 44.9778, "lon": -93.2650, "city": "Minneapolis", "state_code": "MN"},
+    "Ashburn, Virginia (World's Largest Data Center Hub)": {"lat": 39.0438, "lon": -77.4875, "city": "Ashburn", "state_code": "VA"}
+}
+
+selected_target_name = st.selectbox("Select target destination to test:", list(US_TARGETS.keys()))
+selected_target = US_TARGETS[selected_target_name]
+
+# 4. TELEMETRY ENGINE (IP Lookup / Fallback)
+def fetch_system_telemetry(custom_lat=None, custom_lon=None):
+    # Default fallback (Folsom, CA)
     city, state, state_code = "Folsom", "California", "CA"
     lat, lon = 38.6780, -121.1761
     
-    # Try to grab the actual visitor's IP address from Streamlit's network headers
-    try:
-        headers = st.context.headers
-        client_ip = None
-        
-        # Streamlit cloud uses reverse-proxies; the real user's IP sits in X-Forwarded-For
-        if "x-forwarded-for" in headers:
-            client_ip = headers["x-forwarded-for"].split(",")[0].strip()
-        elif "X-Forwarded-For" in headers:
-            client_ip = headers["X-Forwarded-For"].split(",")[0].strip()
-            
-        # If we successfully isolated the visitor's real IP, geolocate them!
-        if client_ip:
-            geo_res = requests.get(f"https://ipapi.co/{client_ip}/json/", timeout=5).json()
-        else:
-            # Fallback to server IP if none detected
-            geo_res = requests.get("https://ipapi.co/json/", timeout=5).json()
-            
-        if "latitude" in geo_res:
-            lat = geo_res["latitude"]
-            lon = geo_res["longitude"]
-            city = geo_res.get("city", "Unknown City")
-            state = geo_res.get("region", "California")
-            state_code = geo_res.get("region_code", "CA")
-    except Exception:
-        pass
+    # Run Auto-Detect if no specific coordinates are provided
+    if custom_lat is None:
+        try:
+            headers = st.context.headers
+            client_ip = None
+            if "x-forwarded-for" in headers:
+                client_ip = headers["x-forwarded-for"].split(",")[0].strip()
+            elif "X-Forwarded-For" in headers:
+                client_ip = headers["X-Forwarded-For"].split(",")[0].strip()
+                
+            if client_ip:
+                geo_res = requests.get(f"https://ipapi.co/{client_ip}/json/", timeout=5).json()
+            else:
+                geo_res = requests.get("https://ipapi.co/json/", timeout=5).json()
+                
+            if "latitude" in geo_res:
+                lat = geo_res["latitude"]
+                lon = geo_res["longitude"]
+                city = geo_res.get("city", "Unknown City")
+                state = geo_res.get("region", "California")
+                state_code = geo_res.get("region_code", "CA")
+        except Exception:
+            pass
+    else:
+        # Use target coordinate profile chosen by user
+        lat, lon = custom_lat, custom_lon
+        city = selected_target["city"]
+        state_code = selected_target["state_code"]
+        state = selected_target["state_code"]
 
     temp_f = 75.0  # Default baseline temp
     try:
@@ -93,25 +115,36 @@ def fetch_system_telemetry():
 
     return city, state, state_code, lat, lon, round(temp_f, 1)
 
-# Execute Telemetry Pull
-city, state, state_code, lat, lon, local_temp = fetch_system_telemetry()
+# Execute telemetry pull
+city, state, state_code, lat, lon, local_temp = fetch_system_telemetry(selected_target["lat"], selected_target["lon"])
 
-# Display Location and Weather Data Streams
-col_a, col_b = st.columns(2)
-with col_a:
-    st.metric(label="🛰️ Visitor Node Location", value=f"{city}, {state}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
-with col_b:
+# Render map visual directly in Streamlit
+map_col, text_col = st.columns([2, 1])
+
+with map_col:
+    m = folium.Map(location=[lat, lon], zoom_start=9)
+    folium.Marker(
+        [lat, lon], 
+        popup=f"{city}, {state_code}", 
+        tooltip=f"Active Simulation: {city}"
+    ).add_to(m)
+    # Output map to web page
+    st_folium(m, height=300, use_container_width=True)
+
+with text_col:
+    st.write("### Telemetry Status")
+    st.metric(label="🛰️ Target Node Location", value=f"{city}, {state_code}", delta=f"Lat: {lat} | Lon: {lon}", delta_color="off")
     is_heatwave = local_temp >= 95.0
     st.metric(
-        label="☀️ Live Telemetry: National Weather Service (NOAA Feed)", 
+        label="☀️ NOAA Weather Feed", 
         value=f"{local_temp} °F", 
-        delta="🔴 CRITICAL GRID THERMAL STRESS ACTIVE" if is_heatwave else "🟢 Standard Atmospheric Matrix",
+        delta="🔴 CRITICAL GRID THERMAL STRESS" if is_heatwave else "🟢 Normal Grid Thermal Load",
         delta_color="inverse" if is_heatwave else "normal"
     )
 
 st.write("---")
 
-# 4. ADVANCED INFRASTRUCTURE MATHEMATICAL MATRIX
+# 5. ADVANCED INFRASTRUCTURE MATHEMATICAL MATRIX
 base_spare_grid = 250.0       # MW capacity baseline
 base_groundwater = 5000000.0  # Gallons per day baseline
 
@@ -151,7 +184,7 @@ total_water_demand = ai_direct_water_demand + ai_indirect_water_demand
 remaining_water = base_groundwater - total_water_demand
 daily_energy_cost = ai_power_demand * 1000 * 24 * electricity_rate
 
-# 5. HIGH-IMPACT METRICS DISPLAY
+# 6. HIGH-IMPACT METRICS DISPLAY
 st.subheader(f"📊 Real-Time Multi-Variable Impact Report ({grid_status})")
 
 col1, col2, col3 = st.columns(3)
@@ -172,7 +205,7 @@ with col5:
 
 st.write("---")
 
-# 6. CRITICAL BREAKING POINT ALERT PROTOCOLS
+# 7. CRITICAL BREAKING POINT ALERT PROTOCOLS
 if remaining_grid < 0 or remaining_water < 0:
     st.error(f"""
     ### 🚨 SYSTEM CRISIS INTERVENTION REQUIRED
@@ -185,7 +218,7 @@ if remaining_grid < 0 or remaining_water < 0:
 else:
     st.success(f"✅ Infrastructure Security Threshold Checked. The {city} grid configuration can securely contain this facility's current engineering envelope.")
 
-# 7. MULTI-LAYER CHARTING
+# 8. MULTI-LAYER CHARTING
 st.subheader("📋 Resource Balance & Nexus Matrix")
 chart_data = {
     "Infrastructure Category": ["Grid Overhead (MW)", "Grid Overhead (MW)", "Water Systems (M-Gal/Day)", "Water Systems (M-Gal/Day)", "Water Systems (M-Gal/Day)"],
@@ -194,4 +227,4 @@ chart_data = {
 }
 st.bar_chart(data=chart_data, x="Infrastructure Category", y="Values", color="System Status", stack=False)
 
-st.caption(f"System Telemetry Signature: Secure handshake verified with api.weather.gov. Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Coordinated Universal Time.")
+st.caption(f"System Telemetry Signature: Secure handshake verified with api.weather.gov. Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC.")
