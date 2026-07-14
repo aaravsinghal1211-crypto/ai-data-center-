@@ -3,10 +3,6 @@ import requests
 from datetime import datetime
 import folium
 from streamlit_folium import st_folium
-import urllib3
-
-# Suppress insecure request warnings from disabling SSL verification (makes console clean)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================================================================
 # PAGE SETUP
@@ -30,19 +26,12 @@ st.caption(
 )
 st.write("---")
 
-# Initialize a debug log in session state to track network errors
-if "debug_log" not in st.session_state:
-    st.session_state.debug_log = []
-
-def log_debug(msg):
-    st.session_state.debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
 # =============================================================================
-# CONSTANTS
+# CONSTANTS (all model assumptions live here so they're easy to audit/tune)
 # =============================================================================
 DEFAULT_COORDS = (38.6780, -121.1761)          # Folsom, CA
 DEFAULT_CITY, DEFAULT_STATE = "Folsom", "CA"
-DEFAULT_POPULATION = 250_000
+DEFAULT_POPULATION = 250_000                    # single source of truth for "unknown county" fallback
 DEFAULT_TEMP_F = 75.0
 
 TECH_HUBS = {
@@ -53,6 +42,7 @@ TECH_HUBS = {
     "Chicago, Illinois (Cook County)":                 {"lat": 41.8781, "lon": -87.6298, "city": "Chicago", "state_code": "IL"},
 }
 
+# County-name -> population lookup. Keys are bare county names (no "County" suffix) in lowercase.
 KNOWN_COUNTY_POPULATIONS = {
     "placer": 410_000, "sacramento": 1_580_000, "st. louis": 200_000,
     "maricopa": 4_500_000, "loudoun": 430_000, "cook": 5_100_000,
@@ -66,18 +56,21 @@ HUMAN_POWER_KWH_PER_PERSON_DAY = 12.0
 
 COOLING_TECH_MODIFIERS = {
     "Traditional Evaporative Cooling":              {"power": 1.00, "water": 1.00},
-    "Direct-to-Chip Liquid Cooling":                {"power": 0.85, "water": 0.30},
-    "Immersion Cooling (Fluid Submersion)":         {"power": 0.80, "water": 0.10},
+    "Direct-to-Chip Liquid Cooling":                {"power": 0.85, "water": 0.30},  # -15% power, -70% water
+    "Immersion Cooling (Fluid Submersion)":         {"power": 0.80, "water": 0.10},  # -20% power, -90% water
 }
 
 WATER_PER_MW_NORMAL = 25_000.0
 WATER_PER_MW_HEATWAVE = 50_000.0
-INDIRECT_WATER_FACTOR_CA = 0.13
-INDIRECT_WATER_FACTOR_OTHER = 1.2
+INDIRECT_WATER_FACTOR_CA = 0.13   # gal per kWh, CA grid mix
+INDIRECT_WATER_FACTOR_OTHER = 1.2  # gal per kWh, thermoelectric-heavy grid mix
 
-HEATWAVE_GRID_CAPACITY_FACTOR = 0.60
+HEATWAVE_GRID_CAPACITY_FACTOR = 0.60   # -40% capacity under heatwave AC surge
 HEATWAVE_RATE_USD_PER_KWH = 0.45
 NORMAL_RATE_USD_PER_KWH = 0.15
+
+# NOTE: NWS's API requires a real identifying contact per their usage policy
+# (https://www.weather.gov/documentation/services-web-api). Replace before production use.
 NWS_USER_AGENT = "(ai-infra-dashboard, contact: replace-with-your-email@example.com)"
 
 # =============================================================================
@@ -93,6 +86,13 @@ data_center_size = st.sidebar.slider(
 cooling_tech = st.sidebar.selectbox(
     "Select Cooling Technology Layer",
     list(COOLING_TECH_MODIFIERS.keys())
+)
+
+st.sidebar.markdown("---")
+show_diagnostics = st.sidebar.checkbox(
+    "🔧 Show network diagnostics",
+    value=False,
+    help="Shows the raw error/status from each external API call, to help debug connectivity issues."
 )
 
 st.sidebar.markdown("---")
@@ -119,72 +119,84 @@ location_mode = st.radio(
 
 lat, lon = DEFAULT_COORDS
 city, state_code = DEFAULT_CITY, DEFAULT_STATE
-location_warning = None
+location_warning = None  # surfaced to the user instead of silently swallowed
+geo_diagnostics = []      # (provider_name, outcome_string) — only shown if diagnostics toggle is on
+
+
+def _try_ipapi_co(client_ip):
+    url = f"https://ipapi.co/{client_ip}/json/" if client_ip else "https://ipapi.co/json/"
+    res = requests.get(url, timeout=5).json()
+    if "latitude" not in res:
+        raise ValueError(res.get("reason") or res.get("error") or "no latitude in response (likely rate-limited)")
+    return {
+        "lat": res["latitude"], "lon": res["longitude"],
+        "city": res.get("city", "Unknown City"), "state_code": res.get("region_code", DEFAULT_STATE),
+        "country_code": res.get("country_code"), "country_name": res.get("country_name"),
+    }
+
+
+def _try_ipapi_com(client_ip):
+    # ip-api.com free tier is HTTP-only (no https) and has its own rate limits (45 req/min).
+    target = client_ip if client_ip else ""
+    res = requests.get(f"http://ip-api.com/json/{target}", timeout=5).json()
+    if res.get("status") != "success":
+        raise ValueError(res.get("message", "ip-api.com returned non-success status"))
+    return {
+        "lat": res["lat"], "lon": res["lon"],
+        "city": res.get("city", "Unknown City"), "state_code": res.get("region", DEFAULT_STATE),
+        "country_code": res.get("countryCode"), "country_name": res.get("country"),
+    }
+
 
 if location_mode == "🛰️ Auto-Detect My Location (Browser/Server IP)":
-    try:
-        log_debug("Starting IP Auto-Detection...")
-        headers = st.context.headers
-        client_ip = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
-        if client_ip:
-            client_ip = client_ip.split(",")[0].strip()
-            log_debug(f"IP extracted from context headers: {client_ip}")
-        
-        # Fallback to ipify with SSL verification bypassed (verify=False)
-        if not client_ip or client_ip in ("127.0.0.1", "localhost", "::1"):
-            try:
-                log_debug("Localhost detected. Pinging ipify for public IP...")
-                client_ip = requests.get("https://api64.ipify.org", timeout=3, verify=False).text.strip()
-                log_debug(f"Public IP fetched from ipify: {client_ip}")
-            except Exception as e:
-                log_debug(f"ipify call failed: {str(e)}")
-                client_ip = None
+    headers = st.context.headers
+    client_ip = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
+    client_ip = client_ip.split(",")[0].strip() if client_ip else None
 
-        # Query geolocation via ip-api.com (we use HTTP to bypass SSL restrictions entirely)
-        geo_url = f"http://ip-api.com/json/{client_ip}" if client_ip else "http://ip-api.com/json/"
-        log_debug(f"Pinging Geolocation API: {geo_url}")
-        geo_res = requests.get(geo_url, timeout=5).json()
+    geo_result = None
+    for provider_name, provider_fn in (("ipapi.co", _try_ipapi_co), ("ip-api.com", _try_ipapi_com)):
+        try:
+            geo_result = provider_fn(client_ip)
+            geo_diagnostics.append((provider_name, "✅ success"))
+            break
+        except Exception as e:
+            geo_diagnostics.append((provider_name, f"❌ {type(e).__name__}: {e}"))
 
-        if geo_res.get("status") == "success" and "lat" in geo_res:
-            lat = geo_res["lat"]
-            lon = geo_res["lon"]
-            city = geo_res.get("city", "Unknown City")
-            state_code = geo_res.get("region", DEFAULT_STATE)
-            log_debug(f"Geolocation Success: {city}, {state_code} ({lat}, {lon})")
+    if geo_result:
+        lat, lon = geo_result["lat"], geo_result["lon"]
+        city, state_code = geo_result["city"], geo_result["state_code"]
+        if geo_result.get("country_code") not in (None, "US"):
+            location_warning = (
+                f"Detected location ({city}, {geo_result.get('country_name', 'unknown country')}) "
+                "is outside the US. Weather and grid-rate assumptions below are US-calibrated "
+                "and may not be meaningful here."
+            )
+    else:
+        location_warning = "All IP geolocation providers failed. Using default: Folsom, CA."
 
-            if geo_res.get("countryCode") not in (None, "US"):
-                location_warning = (
-                    f"Detected location ({city}, {geo_res.get('country', 'unknown country')}) "
-                    "is outside the US. Weather and grid-rate assumptions below are US-calibrated."
-                )
-        else:
-            log_debug(f"ip-api returned non-success status: {geo_res.get('status')}")
-            location_warning = "Could not parse geolocation from IP API. Using default: Folsom, CA."
-    except Exception as e:
-        log_debug(f"Location auto-detection crashed: {str(e)}")
-        location_warning = "Location auto-detection failed (network/API issue). Using default: Folsom, CA."
+    if show_diagnostics:
+        with st.expander("🔧 Geolocation diagnostics", expanded=True):
+            st.write(f"Detected client IP (from proxy headers): `{client_ip or 'none — falling back to server IP'}`")
+            for name, outcome in geo_diagnostics:
+                st.write(f"**{name}:** {outcome}")
 
 elif location_mode == "🏙️ Quick-Select US Tech Hubs":
     hub_selection = st.selectbox("Select target hub:", list(TECH_HUBS.keys()))
     hub = TECH_HUBS[hub_selection]
     lat, lon, city, state_code = hub["lat"], hub["lon"], hub["city"], hub["state_code"]
-    log_debug(f"User manually selected Tech Hub: {city}")
 
 elif location_mode == "📬 Enter US ZIP Code":
     zip_input = st.text_input("Enter any 5-Digit US ZIP Code:", value="95630")
     if zip_input and len(zip_input) == 5 and zip_input.isdigit():
         try:
-            log_debug(f"Pinging ZIP lookup for code: {zip_input}")
-            zip_res = requests.get(f"https://api.zippopotam.us/us/{zip_input}", timeout=5, verify=False).json()
+            zip_res = requests.get(f"https://api.zippopotam.us/us/{zip_input}", timeout=5).json()
             if "places" in zip_res:
                 place = zip_res["places"][0]
                 lat, lon = float(place["latitude"]), float(place["longitude"])
                 city, state_code = place["place name"], place["state abbreviation"]
-                log_debug(f"ZIP Resolution Success: {city}, {state_code}")
             else:
                 location_warning = "ZIP Code not found. Defaulting to baseline Folsom, CA."
-        except Exception as e:
-            log_debug(f"ZIP Code lookup crashed: {str(e)}")
+        except Exception:
             location_warning = "ZIP lookup failed (network/API issue). Defaulting to baseline Folsom, CA."
     elif zip_input:
         location_warning = "Enter a valid 5-digit US ZIP code."
@@ -197,6 +209,7 @@ if location_warning:
 # =============================================================================
 @st.cache_data(ttl=1800)
 def fetch_location_data_streams(lat: float, lon: float):
+    """Returns (county_name, population, temp_f, data_is_partial)."""
     county_name = "Local County"
     local_pop = DEFAULT_POPULATION
     temp_f = DEFAULT_TEMP_F
@@ -205,116 +218,105 @@ def fetch_location_data_streams(lat: float, lon: float):
     # A. Query FCC Census Area API
     try:
         fcc_url = f"https://geo.fcc.gov/api/census/area?lat={lat}&lon={lon}&format=json"
-        fcc_res = requests.get(fcc_url, timeout=5, verify=False).json()
+        fcc_res = requests.get(fcc_url, timeout=5).json()
         results = fcc_res.get("results") or []
         if results:
             raw_name = results[0].get("county_name", "Local County")
             county_name = raw_name
+            # Normalize "Sacramento County" -> "sacramento" before dict lookup.
             lookup_key = raw_name.lower().replace(" county", "").strip()
             local_pop = KNOWN_COUNTY_POPULATIONS.get(lookup_key, DEFAULT_POPULATION)
         else:
             partial = True
-    except Exception as e:
-        log_debug(f"FCC Census API error: {str(e)}")
+    except Exception:
         partial = True
 
-    # B. Query National Weather Service API (Bypass SSL)
+    # B. Query National Weather Service API (US coverage only)
     try:
         nws_headers = {"User-Agent": NWS_USER_AGENT}
         points_res = requests.get(
             f"https://api.weather.gov/points/{round(lat, 4)},{round(lon, 4)}",
-            headers=nws_headers, timeout=5, verify=False
+            headers=nws_headers, timeout=5
         ).json()
         forecast_url = points_res["properties"]["forecastHourly"]
-        forecast_res = requests.get(forecast_url, headers=nws_headers, timeout=5, verify=False).json()
+        forecast_res = requests.get(forecast_url, headers=nws_headers, timeout=5).json()
         current = forecast_res["properties"]["periods"][0]
         temp_f = current["temperature"]
         if current["temperatureUnit"] == "C":
             temp_f = (temp_f * 9 / 5) + 32
-    except Exception as e:
-        log_debug(f"NWS Weather API error: {str(e)}")
+    except Exception:
         partial = True
 
     return county_name, local_pop, round(temp_f, 1), partial
 
 
+# Public Overpass instance (overpass-api.de) is well-known for frequent timeouts/429s under load.
+# Try a couple of alternate mirrors before giving up.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+]
+
+
 @st.cache_data(ttl=1800)
 def scan_local_hydrology(lat: float, lon: float):
-    # Standard 15km Overpass query
+    """Returns (water_body_name, water_body_type, lookup_failed, diagnostics)."""
     query = f"""
-    [out:json][timeout:15];
+    [out:json][timeout:20];
     (
-      nwr["waterway"~"river|canal"](around:15000,{lat},{lon});
-      nwr["natural"="water"](around:15000,{lat},{lon});
-      nwr["landuse"="reservoir"](around:15000,{lat},{lon});
+      nwr["waterway"~"river|canal"](around:30000,{lat},{lon});
+      nwr["natural"="water"](around:30000,{lat},{lon});
+      nwr["landuse"="reservoir"](around:30000,{lat},{lon});
     );
     out tags center;
     """
-    
-    endpoints = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.private.coffee/api/interpreter"
-    ]
-
-    response_data = None
-    success = False
-
-    for endpoint in endpoints:
+    diagnostics = []
+    for mirror_url in OVERPASS_MIRRORS:
         try:
-            log_debug(f"Trying Overpass Endpoint: {endpoint}")
-            response = requests.get(endpoint, params={"data": query}, timeout=10, verify=False)
-            if response.status_code == 200:
-                response_data = response.json()
-                success = True
-                log_debug(f"Overpass success from endpoint: {endpoint}")
-                break
-            else:
-                log_debug(f"Endpoint {endpoint} returned status code: {response.status_code}")
+            response = requests.get(mirror_url, params={"data": query}, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            diagnostics.append((mirror_url, "✅ success"))
+
+            rivers, lakes = [], []
+            for element in data.get("elements", []):
+                tags = element.get("tags", {})
+                name = tags.get("name") or tags.get("official_name")
+                if not name:
+                    continue
+                water_type = tags.get("water") or tags.get("natural") or tags.get("landuse")
+                if water_type in ("reservoir", "lake", "basin") or "lake" in name.lower() or "reservoir" in name.lower():
+                    lakes.append(name)
+                elif "waterway" in tags or "river" in name.lower():
+                    rivers.append(name)
+
+            unique_lakes, unique_rivers = list(set(lakes)), list(set(rivers))
+            if unique_lakes:
+                return max(unique_lakes, key=len), "lake", False, diagnostics
+            if unique_rivers:
+                return max(unique_rivers, key=len), "river", False, diagnostics
+            return "No major surface water bodies detected within 30km", "none", False, diagnostics
         except Exception as e:
-            log_debug(f"Failed to query endpoint {endpoint}: {str(e)}")
+            diagnostics.append((mirror_url, f"❌ {type(e).__name__}: {e}"))
             continue
 
-    if not success or not response_data:
-        return "Hydrology scan unavailable", "none", True
-
-    try:
-        rivers, lakes = [], []
-        for element in response_data.get("elements", []):
-            tags = element.get("tags", {})
-            name = tags.get("name") or tags.get("official_name")
-            if not name:
-                continue
-            water_type = tags.get("water") or tags.get("natural") or tags.get("landuse")
-            if water_type in ("reservoir", "lake", "basin") or "lake" in name.lower() or "reservoir" in name.lower():
-                lakes.append(name)
-            elif "waterway" in tags or "river" in name.lower():
-                rivers.append(name)
-
-        unique_lakes, unique_rivers = list(set(lakes)), list(set(rivers))
-        if unique_lakes:
-            selected_lake = max(unique_lakes, key=len)
-            log_debug(f"Found lake: {selected_lake}")
-            return selected_lake, "lake", False
-        if unique_rivers:
-            selected_river = max(unique_rivers, key=len)
-            log_debug(f"Found river: {selected_river}")
-            return selected_river, "river", False
-        
-        log_debug("No features found matching lake or river inside response payload.")
-        return "No major surface water bodies detected within 15km", "none", False
-    except Exception as e:
-        log_debug(f"Failed parsing OSM payload: {str(e)}")
-        return "Hydrology scan evaluation failed", "none", True
+    return "Hydrology scan unavailable", "none", True, diagnostics
 
 
 with st.spinner("Pulling census, weather, and hydrology telemetry..."):
     county_name, local_population, local_temp, telemetry_partial = fetch_location_data_streams(lat, lon)
-    water_body_name, water_body_type, hydrology_failed = scan_local_hydrology(lat, lon)
+    water_body_name, water_body_type, hydrology_failed, hydrology_diagnostics = scan_local_hydrology(lat, lon)
 
 if telemetry_partial:
     st.info("ℹ️ Some census/weather telemetry could not be retrieved live — partial defaults were used for those fields.")
 if hydrology_failed:
     st.info("ℹ️ Hydrology scan (OpenStreetMap/Overpass) is temporarily unavailable — defaulting to conservative arid-zone assumptions.")
+
+if show_diagnostics:
+    with st.expander("🔧 Hydrology (Overpass) diagnostics", expanded=True):
+        for mirror_url, outcome in hydrology_diagnostics:
+            st.write(f"**{mirror_url}:** {outcome}")
 
 is_heatwave = local_temp >= HEATWAVE_THRESHOLD_F
 
@@ -355,27 +357,32 @@ else:
 base_surface_water = BASE_GROUNDWATER_GAL * surface_water_multiplier
 total_municipal_water_budget = BASE_GROUNDWATER_GAL + base_surface_water
 
-# Human demands
+# Human baseline demands
 human_water_usage_daily = local_population * HUMAN_WATER_GAL_PER_PERSON_DAY
 human_power_usage_daily = local_population * HUMAN_POWER_KWH_PER_PERSON_DAY
 
+# Model imported aqueduct capacity for population centers whose local budget can't cover baseline demand
 if total_municipal_water_budget < (human_water_usage_daily * 1.2):
     total_municipal_water_budget = human_water_usage_daily * 1.5
     surface_water_source += " + Imported Aqueduct Systems"
 
+# Cooling-tech efficiency
 modifiers = COOLING_TECH_MODIFIERS[cooling_tech]
 power_modifier, water_modifier = modifiers["power"], modifiers["water"]
 
+# AI direct demands
 ai_power_demand_mw = data_center_size * power_modifier
 ai_power_demand_kwh_daily = ai_power_demand_mw * 1000 * 24
 
 base_water_per_mw = WATER_PER_MW_HEATWAVE if is_heatwave else WATER_PER_MW_NORMAL
 ai_direct_water_demand = (data_center_size * base_water_per_mw) * water_modifier
 
+# Indirect (Scope 2) water via grid generation
 indirect_water_factor = INDIRECT_WATER_FACTOR_CA if state_code == "CA" else INDIRECT_WATER_FACTOR_OTHER
 ai_indirect_water_demand = ai_power_demand_kwh_daily * indirect_water_factor
 total_ai_water_demand = ai_direct_water_demand + ai_indirect_water_demand
 
+# Grid headroom & pricing under heatwave stress
 if is_heatwave:
     available_grid = BASE_SPARE_GRID_MW * HEATWAVE_GRID_CAPACITY_FACTOR
     electricity_rate = HEATWAVE_RATE_USD_PER_KWH
@@ -389,6 +396,7 @@ remaining_grid = available_grid - ai_power_demand_mw
 remaining_water = total_municipal_water_budget - (human_water_usage_daily + total_ai_water_demand)
 daily_energy_cost = ai_power_demand_kwh_daily * electricity_rate
 
+# Guard against divide-by-zero for edge-case zero population
 water_ratio = (total_ai_water_demand / human_water_usage_daily * 100.0) if human_water_usage_daily else 0.0
 power_ratio = (ai_power_demand_kwh_daily / human_power_usage_daily * 100.0) if human_power_usage_daily else 0.0
 
@@ -485,7 +493,7 @@ else:
     """)
 
 # =============================================================================
-# CHARTS
+# CHARTS — split by unit so bar heights are directly comparable within each chart
 # =============================================================================
 st.subheader("📋 Resource Balance & Nexus Matrix")
 
@@ -509,16 +517,7 @@ with chart_col2:
 
 st.markdown(f"🛰️ **Live Hydrological Telemetry:** Nearby Water Body detected: **{surface_water_source}**.")
 st.caption(
-    f"System Telemetry Signature: handshakes attempted with ipify.org, ip-api.com, geo.fcc.gov, "
-    f"api.weather.gov, and overpass-api.de mirrors. "
+    f"System Telemetry Signature: handshakes attempted with api.zippopotam.us, geo.fcc.gov, "
+    f"api.weather.gov, and overpass-api.de (fields default to conservative estimates on failure). "
     f"Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC."
 )
-
-# =============================================================================
-# SYSTEM DIAGNOSTIC PANEL (For Troubleshooting Network/Firewall Blocks)
-# =============================================================================
-st.write("---")
-with st.expander("🛠️ System Telemetry Debug Console (Click to expand if APIs are failing)"):
-    st.write("If you see errors below referring to `SSLError`, `ConnectionRefused`, or `Timeout`, your local internet network/firewall is blocking outbound Python connections.")
-    for entry in st.session_state.debug_log:
-        st.code(entry)
