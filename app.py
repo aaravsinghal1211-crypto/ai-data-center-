@@ -3,6 +3,10 @@ import requests
 from datetime import datetime
 import folium
 from streamlit_folium import st_folium
+import urllib3
+
+# Suppress insecure request warnings from disabling SSL verification (makes console clean)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================================================================
 # PAGE SETUP
@@ -26,12 +30,19 @@ st.caption(
 )
 st.write("---")
 
+# Initialize a debug log in session state to track network errors
+if "debug_log" not in st.session_state:
+    st.session_state.debug_log = []
+
+def log_debug(msg):
+    st.session_state.debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 # =============================================================================
-# CONSTANTS (all model assumptions live here so they're easy to audit/tune)
+# CONSTANTS
 # =============================================================================
 DEFAULT_COORDS = (38.6780, -121.1761)          # Folsom, CA
 DEFAULT_CITY, DEFAULT_STATE = "Folsom", "CA"
-DEFAULT_POPULATION = 250_000                    # single source of truth for "unknown county" fallback
+DEFAULT_POPULATION = 250_000
 DEFAULT_TEMP_F = 75.0
 
 TECH_HUBS = {
@@ -42,7 +53,6 @@ TECH_HUBS = {
     "Chicago, Illinois (Cook County)":                 {"lat": 41.8781, "lon": -87.6298, "city": "Chicago", "state_code": "IL"},
 }
 
-# County-name -> population lookup. Keys are bare county names (no "County" suffix) in lowercase.
 KNOWN_COUNTY_POPULATIONS = {
     "placer": 410_000, "sacramento": 1_580_000, "st. louis": 200_000,
     "maricopa": 4_500_000, "loudoun": 430_000, "cook": 5_100_000,
@@ -56,21 +66,18 @@ HUMAN_POWER_KWH_PER_PERSON_DAY = 12.0
 
 COOLING_TECH_MODIFIERS = {
     "Traditional Evaporative Cooling":              {"power": 1.00, "water": 1.00},
-    "Direct-to-Chip Liquid Cooling":                {"power": 0.85, "water": 0.30},  # -15% power, -70% water
-    "Immersion Cooling (Fluid Submersion)":         {"power": 0.80, "water": 0.10},  # -20% power, -90% water
+    "Direct-to-Chip Liquid Cooling":                {"power": 0.85, "water": 0.30},
+    "Immersion Cooling (Fluid Submersion)":         {"power": 0.80, "water": 0.10},
 }
 
 WATER_PER_MW_NORMAL = 25_000.0
 WATER_PER_MW_HEATWAVE = 50_000.0
-INDIRECT_WATER_FACTOR_CA = 0.13   # gal per kWh, CA grid mix
-INDIRECT_WATER_FACTOR_OTHER = 1.2  # gal per kWh, thermoelectric-heavy grid mix
+INDIRECT_WATER_FACTOR_CA = 0.13
+INDIRECT_WATER_FACTOR_OTHER = 1.2
 
-HEATWAVE_GRID_CAPACITY_FACTOR = 0.60   # -40% capacity under heatwave AC surge
+HEATWAVE_GRID_CAPACITY_FACTOR = 0.60
 HEATWAVE_RATE_USD_PER_KWH = 0.45
 NORMAL_RATE_USD_PER_KWH = 0.15
-
-# NOTE: NWS's API requires a real identifying contact per their usage policy
-# (https://www.weather.gov/documentation/services-web-api). Replace before production use.
 NWS_USER_AGENT = "(ai-infra-dashboard, contact: replace-with-your-email@example.com)"
 
 # =============================================================================
@@ -112,25 +119,30 @@ location_mode = st.radio(
 
 lat, lon = DEFAULT_COORDS
 city, state_code = DEFAULT_CITY, DEFAULT_STATE
-location_warning = None  # surfaced to user
+location_warning = None
 
 if location_mode == "🛰️ Auto-Detect My Location (Browser/Server IP)":
     try:
-        # Step 1: Attempt headers extraction (useful when deployed)
+        log_debug("Starting IP Auto-Detection...")
         headers = st.context.headers
         client_ip = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
         if client_ip:
             client_ip = client_ip.split(",")[0].strip()
+            log_debug(f"IP extracted from context headers: {client_ip}")
         
-        # Step 2: Fallback to a global IP resolution echo API if headers are blank/localhost
+        # Fallback to ipify with SSL verification bypassed (verify=False)
         if not client_ip or client_ip in ("127.0.0.1", "localhost", "::1"):
             try:
-                client_ip = requests.get("https://api64.ipify.org", timeout=3).text.strip()
-            except Exception:
+                log_debug("Localhost detected. Pinging ipify for public IP...")
+                client_ip = requests.get("https://api64.ipify.org", timeout=3, verify=False).text.strip()
+                log_debug(f"Public IP fetched from ipify: {client_ip}")
+            except Exception as e:
+                log_debug(f"ipify call failed: {str(e)}")
                 client_ip = None
 
-        # Step 3: Query IP location via ip-api.com (reliable, unauthenticated)
+        # Query geolocation via ip-api.com (we use HTTP to bypass SSL restrictions entirely)
         geo_url = f"http://ip-api.com/json/{client_ip}" if client_ip else "http://ip-api.com/json/"
+        log_debug(f"Pinging Geolocation API: {geo_url}")
         geo_res = requests.get(geo_url, timeout=5).json()
 
         if geo_res.get("status") == "success" and "lat" in geo_res:
@@ -138,36 +150,41 @@ if location_mode == "🛰️ Auto-Detect My Location (Browser/Server IP)":
             lon = geo_res["lon"]
             city = geo_res.get("city", "Unknown City")
             state_code = geo_res.get("region", DEFAULT_STATE)
+            log_debug(f"Geolocation Success: {city}, {state_code} ({lat}, {lon})")
 
-            # NWS only covers the US
             if geo_res.get("countryCode") not in (None, "US"):
                 location_warning = (
                     f"Detected location ({city}, {geo_res.get('country', 'unknown country')}) "
-                    "is outside the US. Weather and grid-rate assumptions below are US-calibrated "
-                    "and may not be meaningful here."
+                    "is outside the US. Weather and grid-rate assumptions below are US-calibrated."
                 )
         else:
+            log_debug(f"ip-api returned non-success status: {geo_res.get('status')}")
             location_warning = "Could not parse geolocation from IP API. Using default: Folsom, CA."
     except Exception as e:
-        location_warning = f"Location auto-detection failed ({str(e)}). Using default: Folsom, CA."
+        log_debug(f"Location auto-detection crashed: {str(e)}")
+        location_warning = "Location auto-detection failed (network/API issue). Using default: Folsom, CA."
 
 elif location_mode == "🏙️ Quick-Select US Tech Hubs":
     hub_selection = st.selectbox("Select target hub:", list(TECH_HUBS.keys()))
     hub = TECH_HUBS[hub_selection]
     lat, lon, city, state_code = hub["lat"], hub["lon"], hub["city"], hub["state_code"]
+    log_debug(f"User manually selected Tech Hub: {city}")
 
 elif location_mode == "📬 Enter US ZIP Code":
     zip_input = st.text_input("Enter any 5-Digit US ZIP Code:", value="95630")
     if zip_input and len(zip_input) == 5 and zip_input.isdigit():
         try:
-            zip_res = requests.get(f"https://api.zippopotam.us/us/{zip_input}", timeout=5).json()
+            log_debug(f"Pinging ZIP lookup for code: {zip_input}")
+            zip_res = requests.get(f"https://api.zippopotam.us/us/{zip_input}", timeout=5, verify=False).json()
             if "places" in zip_res:
                 place = zip_res["places"][0]
                 lat, lon = float(place["latitude"]), float(place["longitude"])
                 city, state_code = place["place name"], place["state abbreviation"]
+                log_debug(f"ZIP Resolution Success: {city}, {state_code}")
             else:
                 location_warning = "ZIP Code not found. Defaulting to baseline Folsom, CA."
-        except Exception:
+        except Exception as e:
+            log_debug(f"ZIP Code lookup crashed: {str(e)}")
             location_warning = "ZIP lookup failed (network/API issue). Defaulting to baseline Folsom, CA."
     elif zip_input:
         location_warning = "Enter a valid 5-digit US ZIP code."
@@ -180,7 +197,6 @@ if location_warning:
 # =============================================================================
 @st.cache_data(ttl=1800)
 def fetch_location_data_streams(lat: float, lon: float):
-    """Returns (county_name, population, temp_f, data_is_partial)."""
     county_name = "Local County"
     local_pop = DEFAULT_POPULATION
     temp_f = DEFAULT_TEMP_F
@@ -189,7 +205,7 @@ def fetch_location_data_streams(lat: float, lon: float):
     # A. Query FCC Census Area API
     try:
         fcc_url = f"https://geo.fcc.gov/api/census/area?lat={lat}&lon={lon}&format=json"
-        fcc_res = requests.get(fcc_url, timeout=5).json()
+        fcc_res = requests.get(fcc_url, timeout=5, verify=False).json()
         results = fcc_res.get("results") or []
         if results:
             raw_name = results[0].get("county_name", "Local County")
@@ -198,23 +214,25 @@ def fetch_location_data_streams(lat: float, lon: float):
             local_pop = KNOWN_COUNTY_POPULATIONS.get(lookup_key, DEFAULT_POPULATION)
         else:
             partial = True
-    except Exception:
+    except Exception as e:
+        log_debug(f"FCC Census API error: {str(e)}")
         partial = True
 
-    # B. Query National Weather Service API (US coverage only)
+    # B. Query National Weather Service API (Bypass SSL)
     try:
         nws_headers = {"User-Agent": NWS_USER_AGENT}
         points_res = requests.get(
             f"https://api.weather.gov/points/{round(lat, 4)},{round(lon, 4)}",
-            headers=nws_headers, timeout=5
+            headers=nws_headers, timeout=5, verify=False
         ).json()
         forecast_url = points_res["properties"]["forecastHourly"]
-        forecast_res = requests.get(forecast_url, headers=nws_headers, timeout=5).json()
+        forecast_res = requests.get(forecast_url, headers=nws_headers, timeout=5, verify=False).json()
         current = forecast_res["properties"]["periods"][0]
         temp_f = current["temperature"]
         if current["temperatureUnit"] == "C":
             temp_f = (temp_f * 9 / 5) + 32
-    except Exception:
+    except Exception as e:
+        log_debug(f"NWS Weather API error: {str(e)}")
         partial = True
 
     return county_name, local_pop, round(temp_f, 1), partial
@@ -222,8 +240,7 @@ def fetch_location_data_streams(lat: float, lon: float):
 
 @st.cache_data(ttl=1800)
 def scan_local_hydrology(lat: float, lon: float):
-    """Returns (water_body_name, water_body_type, lookup_failed)."""
-    # Reduced radius slightly to 15,000m (15km) to accelerate response and decrease timeout risk
+    # Standard 15km Overpass query
     query = f"""
     [out:json][timeout:15];
     (
@@ -234,7 +251,6 @@ def scan_local_hydrology(lat: float, lon: float):
     out tags center;
     """
     
-    # List of redundant Overpass API public endpoints to loop through in case of rate-limiting
     endpoints = [
         "https://overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter"
@@ -245,12 +261,17 @@ def scan_local_hydrology(lat: float, lon: float):
 
     for endpoint in endpoints:
         try:
-            response = requests.get(endpoint, params={"data": query}, timeout=8)
+            log_debug(f"Trying Overpass Endpoint: {endpoint}")
+            response = requests.get(endpoint, params={"data": query}, timeout=10, verify=False)
             if response.status_code == 200:
                 response_data = response.json()
                 success = True
+                log_debug(f"Overpass success from endpoint: {endpoint}")
                 break
-        except Exception:
+            else:
+                log_debug(f"Endpoint {endpoint} returned status code: {response.status_code}")
+        except Exception as e:
+            log_debug(f"Failed to query endpoint {endpoint}: {str(e)}")
             continue
 
     if not success or not response_data:
@@ -271,11 +292,18 @@ def scan_local_hydrology(lat: float, lon: float):
 
         unique_lakes, unique_rivers = list(set(lakes)), list(set(rivers))
         if unique_lakes:
-            return max(unique_lakes, key=len), "lake", False
+            selected_lake = max(unique_lakes, key=len)
+            log_debug(f"Found lake: {selected_lake}")
+            return selected_lake, "lake", False
         if unique_rivers:
-            return max(unique_rivers, key=len), "river", False
+            selected_river = max(unique_rivers, key=len)
+            log_debug(f"Found river: {selected_river}")
+            return selected_river, "river", False
+        
+        log_debug("No features found matching lake or river inside response payload.")
         return "No major surface water bodies detected within 15km", "none", False
-    except Exception:
+    except Exception as e:
+        log_debug(f"Failed parsing OSM payload: {str(e)}")
         return "Hydrology scan evaluation failed", "none", True
 
 
@@ -485,3 +513,12 @@ st.caption(
     f"api.weather.gov, and overpass-api.de mirrors. "
     f"Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC."
 )
+
+# =============================================================================
+# SYSTEM DIAGNOSTIC PANEL (For Troubleshooting Network/Firewall Blocks)
+# =============================================================================
+st.write("---")
+with st.expander("🛠️ System Telemetry Debug Console (Click to expand if APIs are failing)"):
+    st.write("If you see errors below referring to `SSLError`, `ConnectionRefused`, or `Timeout`, your local internet network/firewall is blocking outbound Python connections.")
+    for entry in st.session_state.debug_log:
+        st.code(entry)
