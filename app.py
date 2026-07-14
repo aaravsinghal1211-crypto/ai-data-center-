@@ -129,7 +129,7 @@ with map_col:
         tooltip=f"Active Simulation: {city}"
     ).add_to(m)
     # Output map to web page
-    st_folium(m, height=300, use_container_width=True)
+    st_folium(m, height=300, width=700)
 
 with text_col:
     st.write("### Telemetry Status")
