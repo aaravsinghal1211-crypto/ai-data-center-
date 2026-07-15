@@ -159,7 +159,7 @@ elif location_mode == "🏙️ Quick-Select US Tech Hubs":
     fallback_water = hub["water"]
 
 elif location_mode == "📬 Enter US ZIP Code":
-    zip_input = st.text_input("Enter any 5-Digit US ZIP Code:", value="95630")
+    zip_input = st.text_input("Enter any 5-Digit US ZIP Code: Ex: 12345", value="95630")
     if zip_input and len(zip_input) == 5 and zip_input.isdigit():
         try:
             zip_res = requests.get(f"https://api.zippopotam.us/us/{zip_input}", timeout=4, verify=False).json()
